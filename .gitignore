@@ -1,0 +1,23 @@
+# Python / IDE / OS junk
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.dll
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Secret files
+secret.txt
+secret_*.txt
+*.secret
+aes_key.txt
+
+# Ignored folders
+venv/
+results/
+data/
+decoded/
+encoded/
