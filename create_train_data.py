@@ -3,20 +3,19 @@ import pandas as pd
 import os
 import matplotlib.pyplot as plt
 
-def generate_csv_dataset(n_samples=50000):
-    print("[-] Đang sinh dữ liệu WebSocket (Wide-Band) & Nhiễu tự nhiên...")
+def generate_csv_dataset(n_samples=100000):
     
     # 1. Khởi tạo nhãn (Bit 0 và Bit 1)
     np.random.seed(42)
     labels = np.random.randint(0, 2, n_samples)
     
-    # 2. Rải đều Base IPD
+    # 2. Rải đều Base IPD - CẬP NHẬT RANGES
     base_ipd = np.zeros(n_samples)
     mask_0 = (labels == 0)
     mask_1 = (labels == 1)
     
-    base_ipd[mask_0] = np.random.uniform(low=0.40, high=0.65, size=np.sum(mask_0))
-    base_ipd[mask_1] = np.random.uniform(low=0.85, high=1.10, size=np.sum(mask_1))
+    base_ipd[mask_0] = np.random.uniform(low=0.35, high=0.65, size=np.sum(mask_0))  # Bit 0: 0.35-0.65
+    base_ipd[mask_1] = np.random.uniform(low=0.80, high=1.10, size=np.sum(mask_1))  # Bit 1: 0.80-1.10
     
     # 3. Thêm nhiễu mạng tự nhiên
     normal_jitter = np.random.normal(loc=0.0, scale=0.03, size=n_samples)
@@ -45,30 +44,24 @@ def generate_csv_dataset(n_samples=50000):
     print("[-] Đang vẽ biểu đồ phân phối...")
     plt.figure(figsize=(12, 6))
     
-    # Tách dữ liệu ra 2 mảng để vẽ 2 màu khác nhau
     ipd_bit0 = ipds[mask_0]
     ipd_bit1 = ipds[mask_1]
     
-    # Vẽ Histogram
-    # Bins=100 chia đồ thị thành 100 cột nhỏ để nhìn rõ chi tiết
-    # Alpha=0.7 làm màu hơi trong suốt để thấy rõ ranh giới
-    plt.hist(ipd_bit0, bins=100, color='#2980b9', alpha=0.7, label='Bit 0 (Base: 0.40s - 0.65s)')
-    plt.hist(ipd_bit1, bins=100, color='#e74c3c', alpha=0.7, label='Bit 1 (Base: 0.85s - 1.10s)')
+    plt.hist(ipd_bit0, bins=100, color='#2980b9', alpha=0.7, label='Bit 0 (Base: 0.35s - 0.65s)')
+    plt.hist(ipd_bit1, bins=100, color='#e74c3c', alpha=0.7, label='Bit 1 (Base: 0.80s - 1.10s)')
     
-    # Vẽ vạch Threshold 0.75s
-    plt.axvline(x=0.75, color='#27ae60', linestyle='dashed', linewidth=2.5, label='Ngưỡng Giải Mã (Threshold = 0.75s)')
+    # Threshold: giữa 0.65 và 0.80 -> 0.725s
+    plt.axvline(x=0.72, color='#27ae60', linestyle='dashed', linewidth=2.5, label='Ngưỡng Giải Mã (Threshold = 0.72s)')
     
-    # Trang trí biểu đồ
     plt.title('Phân phối Kênh ẩn Wide-Band (Đã bao gồm Network Jitter & Lag)', fontsize=14, fontweight='bold')
     plt.xlabel('Thời gian trễ - IPD (giây)', fontsize=12)
     plt.ylabel('Tần suất (Số lượng gói tin)', fontsize=12)
     plt.legend(fontsize=11)
     plt.grid(True, linestyle='--', alpha=0.5)
     
-    # Lưu file ảnh
     vis_path = os.path.join("helper/data", "distribution_preview.png")
     plt.tight_layout()
-    plt.savefig(vis_path, dpi=300) # dpi=300 cho ảnh nét căng để dán vào báo cáo
+    plt.savefig(vis_path, dpi=300)
     
     print(f"[+] Hoàn tất! Đã lưu biểu đồ cực nét tại: {vis_path}")
     print(f"    -> Dữ liệu IPD: {path_raw}")

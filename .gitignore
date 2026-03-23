@@ -20,3 +20,4 @@ venv/
 results/
 decoded/
 encoded/
+test/
