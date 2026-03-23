@@ -3,87 +3,76 @@ import pandas as pd
 import os
 import matplotlib.pyplot as plt
 
-def create_dataset(num_samples=50000):
-    print(f"[-] Đang tạo {num_samples} mẫu dữ liệu train (Mixture of Gaussians)...")
+def generate_csv_dataset(n_samples=50000):
+    print("[-] Đang sinh dữ liệu WebSocket (Wide-Band) & Nhiễu tự nhiên...")
     
-    # Decision boundary
-    THRESHOLD = 0.125
+    # 1. Khởi tạo nhãn (Bit 0 và Bit 1)
+    np.random.seed(42)
+    labels = np.random.randint(0, 2, n_samples)
     
-    data = []
-    labels = []
-    # Tạo dữ liệu với phân phối TỰ NHIÊN - có overlap
-    # Nhưng LABEL dựa trên threshold, không phải dựa trên ý định ban đầu
-    for _ in range(num_samples):
-        # Chọn ngẫu nhiên muốn tạo Bit 0 hay Bit 1
-        intended_bit = np.random.randint(0, 2)
-        
-        if intended_bit == 0:
-            # Bit 0: Trung tâm vùng 0.08s - 0.125s
-            sub_choice = np.random.randint(0, 3)
-            if sub_choice == 0:
-                val = np.random.normal(loc=0.09, scale=0.008)
-            elif sub_choice == 1:
-                val = np.random.normal(loc=0.102, scale=0.008)
-            else:
-                val = np.random.normal(loc=0.115, scale=0.008)
-        else:
-            # Bit 1: Trung tâm vùng 0.125s - 0.20s
-            sub_choice = np.random.randint(0, 3)
-            if sub_choice == 0:
-                val = np.random.normal(loc=0.135, scale=0.01)
-            elif sub_choice == 1:
-                val = np.random.normal(loc=0.160, scale=0.01)
-            else:
-                val = np.random.normal(loc=0.185, scale=0.01)
-        
-        # Đảm bảo không âm
-        val = max(0.001, val)
-        
-        # QUAN TRỌNG: Label dựa trên THRESHOLD, không phải intended_bit
-        # Điều này giúp model học đúng decision boundary
-        actual_label = 0 if val < THRESHOLD else 1
-        
-        data.append(val)
-        labels.append(actual_label)
+    # 2. Rải đều Base IPD
+    base_ipd = np.zeros(n_samples)
+    mask_0 = (labels == 0)
+    mask_1 = (labels == 1)
     
-    data = np.array(data)
-    labels = np.array(labels)
+    base_ipd[mask_0] = np.random.uniform(low=0.40, high=0.65, size=np.sum(mask_0))
+    base_ipd[mask_1] = np.random.uniform(low=0.85, high=1.10, size=np.sum(mask_1))
     
-    # 3. Lưu file
-    output_dir_data = r"helper/data/raw"
-    output_dir_labels = r"helper/data/raw_labels"
-    os.makedirs(output_dir_data, exist_ok=True)
-    os.makedirs(output_dir_labels, exist_ok=True)
+    # 3. Thêm nhiễu mạng tự nhiên
+    normal_jitter = np.random.normal(loc=0.0, scale=0.03, size=n_samples)
+    lag_spikes = np.random.exponential(scale=0.02, size=n_samples)
     
-    # Lưu Data
-    pd.DataFrame(data, columns=["IPD"]).to_csv(
-        os.path.join(output_dir_data, "custom_traffic_data.csv"), index=False
-    )
+    ipds = base_ipd + normal_jitter + lag_spikes
+    ipds = np.clip(ipds, 0.2, 1.5)
     
-    # Lưu Labels
-    pd.DataFrame(labels, columns=["Label"]).to_csv(
-        os.path.join(output_dir_labels, "custom_traffic_labels.csv"), index=False
-    )
+    # ==========================================
+    # LƯU FILE CSV
+    # ==========================================
+    dir_raw = "helper/data/raw"
+    dir_labels = "helper/data/raw_labels"
+    os.makedirs(dir_raw, exist_ok=True)
+    os.makedirs(dir_labels, exist_ok=True)
     
-    # Thống kê
-    bit0_count = np.sum(labels == 0)
-    bit1_count = np.sum(labels == 1)
+    path_raw = os.path.join(dir_raw, "heartbeat_ipd.csv")
+    path_labels = os.path.join(dir_labels, "heartbeat_labels.csv")
     
-    print("[+] Đã tạo xong dữ liệu Mixed Gaussian!")
-    print(f"    - Threshold: {THRESHOLD}s")
-    print(f"    - Bit 0 (IPD < {THRESHOLD}s): {bit0_count} samples ({100*bit0_count/num_samples:.1f}%)")
-    print(f"    - Bit 1 (IPD >= {THRESHOLD}s): {bit1_count} samples ({100*bit1_count/num_samples:.1f}%)")
+    pd.DataFrame(ipds, columns=["IPD"]).to_csv(path_raw, index=False)
+    pd.DataFrame(labels, columns=["Bit_Label"]).to_csv(path_labels, index=False)
+    
+    # ==========================================
+    # VẼ BIỂU ĐỒ TRỰC QUAN HÓA (VISUALIZATION)
+    # ==========================================
+    print("[-] Đang vẽ biểu đồ phân phối...")
+    plt.figure(figsize=(12, 6))
+    
+    # Tách dữ liệu ra 2 mảng để vẽ 2 màu khác nhau
+    ipd_bit0 = ipds[mask_0]
+    ipd_bit1 = ipds[mask_1]
     
     # Vẽ Histogram
-    plt.figure(figsize=(10, 5))
-    plt.hist(data[labels==0], bins=50, alpha=0.6, label='Bit 0 (IPD < 0.125s)', color='blue')
-    plt.hist(data[labels==1], bins=50, alpha=0.6, label='Bit 1 (IPD >= 0.125s)', color='red')
-    plt.axvline(x=THRESHOLD, color='green', linestyle='--', linewidth=2, label=f'Threshold = {THRESHOLD}s')
-    plt.title("Phân phối dữ liệu Train (Label = f(IPD), không phải f(intended))")
-    plt.xlabel("IPD (s)")
-    plt.legend()
-    plt.savefig("data_distribution")
-    plt.show()
+    # Bins=100 chia đồ thị thành 100 cột nhỏ để nhìn rõ chi tiết
+    # Alpha=0.7 làm màu hơi trong suốt để thấy rõ ranh giới
+    plt.hist(ipd_bit0, bins=100, color='#2980b9', alpha=0.7, label='Bit 0 (Base: 0.40s - 0.65s)')
+    plt.hist(ipd_bit1, bins=100, color='#e74c3c', alpha=0.7, label='Bit 1 (Base: 0.85s - 1.10s)')
+    
+    # Vẽ vạch Threshold 0.75s
+    plt.axvline(x=0.75, color='#27ae60', linestyle='dashed', linewidth=2.5, label='Ngưỡng Giải Mã (Threshold = 0.75s)')
+    
+    # Trang trí biểu đồ
+    plt.title('Phân phối Kênh ẩn Wide-Band (Đã bao gồm Network Jitter & Lag)', fontsize=14, fontweight='bold')
+    plt.xlabel('Thời gian trễ - IPD (giây)', fontsize=12)
+    plt.ylabel('Tần suất (Số lượng gói tin)', fontsize=12)
+    plt.legend(fontsize=11)
+    plt.grid(True, linestyle='--', alpha=0.5)
+    
+    # Lưu file ảnh
+    vis_path = os.path.join("helper/data", "distribution_preview.png")
+    plt.tight_layout()
+    plt.savefig(vis_path, dpi=300) # dpi=300 cho ảnh nét căng để dán vào báo cáo
+    
+    print(f"[+] Hoàn tất! Đã lưu biểu đồ cực nét tại: {vis_path}")
+    print(f"    -> Dữ liệu IPD: {path_raw}")
+    print(f"    -> Nhãn Bit:    {path_labels}")
 
 if __name__ == "__main__":
-    create_dataset()
+    generate_csv_dataset()

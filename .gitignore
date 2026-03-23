@@ -18,6 +18,5 @@ aes_key.txt
 # Ignored folders
 venv/
 results/
-data/
 decoded/
 encoded/
