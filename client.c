@@ -486,6 +486,8 @@
 		 err(ERR_EXIT, "connect");
 	 printf("connected.\n");
 	 
+	 int flag = 1;
+    	 setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (char *) &flag, sizeof(int));
 	 /* create protocol header */
 	 bzero(&hdr, sizeof(cceap_header_t));
 	 if (sequence_number_set)

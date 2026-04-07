@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import pandas as pd
+import helper
 
 # ============================================================
 # KIẾN TRÚC MODEL TỪ ĐỒ ÁN
@@ -50,7 +51,7 @@ class NoiseGenerator(nn.Module):
 # ============================================================
 # PRE-SHARED PARAMETERS (PHẢI GIỐNG FILE HUẤN LUYỆN)
 # ============================================================
-MODEL_PATH = "models/covert_channel_generator.pth"
+MODEL_PATH = "helper/models/covert_channel_generator.pth"
 BCH_ENCODE_BIN = "./bch_encode"
 
 # Hằng số vật lý (từ đồ án)
@@ -70,10 +71,10 @@ MODULE_NAME = "gru"
 NOISE_SCALE = 0.4  # Phải khớp với lúc training
 SEED = 2025         # Shared seed cực kỳ quan trọng
 
-# BCH Params (dùng cho bch_encode binary)
-BCH_LOW_DELAY = 5.0    # ms - đại diện bit=1
-BCH_HIGH_DELAY = 15.0  # ms - đại diện bit=0
-BCH_THRESHOLD = 10.0   # ms - ngưỡng phân biệt 0/1
+# BCH Params (dùng cho bch_encode binary, PHẢI KHỚP VỚI DECODER)
+BCH_LOW_DELAY = 0.5    # ms - đại diện bit=1
+BCH_HIGH_DELAY = 1     # ms - đại diện bit=0
+BCH_THRESHOLD = 0.75   # ms - ngưỡng phân biệt 0/1
 
 def inverse_scale(data_scaled):
     return data_scaled * (PHYS_MAX - PHYS_MIN) + PHYS_MIN
@@ -188,9 +189,11 @@ def main():
         
     print(f"[4] GAN encoded: {len(ipds)} IPDs")
     
-    # 5. Save
-    pd.DataFrame({'IPDs': ipds}).to_csv(args.output, index=False)
-    print(f"[5] Saved: {args.output}")
+      # 5. Save — format: comma-separated milliseconds, 1 dòng (client.c đọc dạng này)
+    ipds_ms = [ipd * 1000.0 for ipd in ipds]  # giây → milliseconds
+    with open(args.output, 'w') as f:
+        f.write(','.join(f'{v:.3f}' for v in ipds_ms))
+    print(f"[5] Saved: {args.output} (ms, comma-separated)")
     
     print(f"\n{'='*50}")
     print(f"Hoàn thành! {file_size} bytes → {len(ipds)} IPDs")

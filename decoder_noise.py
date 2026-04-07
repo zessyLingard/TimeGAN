@@ -47,7 +47,7 @@ class NoiseGenerator(nn.Module):
 # ============================================================
 # PRE-SHARED PARAMETERS (PHẢI GIỐNG ENCODER)
 # ============================================================
-MODEL_PATH = "models/covert_channel_generator.pth"
+MODEL_PATH = "helper/models/covert_channel_generator.pth"
 BCH_DECODE_BIN = "./bch_decode"
 
 # Hằng số vật lý
@@ -216,16 +216,12 @@ def main():
     
     # 2. Đọc IPD CSV
     print(f"[2] Đọc IPD từ {args.input}...")
-    df = pd.read_csv(args.input)
     
-    # Hỗ trợ cả column name 'IPDs' và 'IPD'
-    if 'IPDs' in df.columns:
-        received_ipds = df['IPDs'].values.tolist()
-    elif 'IPD' in df.columns:
-        received_ipds = df['IPD'].values.tolist()
-    else:
-        # Nếu không có header, đọc column đầu tiên
-        received_ipds = df.iloc[:, 0].values.tolist()
+    # header=None để tránh việc Pandas tự ý nuốt dòng đầu tiên làm tên cột
+    df = pd.read_csv(args.input, header=None)
+    
+    # Ép kiểu cột đầu tiên về số thực, tự động bỏ qua chữ (như 'IPDs' hoặc 'IPD') nếu có
+    received_ipds = pd.to_numeric(df.iloc[:, 0], errors='coerce').dropna().tolist()
     
     print(f"    ✓ Đã đọc {len(received_ipds)} IPD values")
     
