@@ -1,87 +1,25 @@
 /*
- * BCH Encoder with AES-256-CBC for CCEAP Covert Timing Channel
- * Usage: ./bch_encode <input_file> <low_delay_ms> <high_delay_ms>
- * 
- * Reads AES key from aes_key.txt (64 hex chars = 32 bytes)
- * Pipeline: file -> AES-256-CBC encrypt (with PKCS7 padding) -> BCH encode -> IAT output
- * 
- * Compile: gcc -o bch_encode bch_encode.c -lssl -lcrypto
+ * BCH Encoder for CCEAP Covert Timing Channel
+ * Usage: ./bch_encode <input_file> <low_delay_ms> <high_delay_ms> [-k password]
  */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef USE_AES
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#endif
 
 #define BCH_M 8
 #define BCH_N 255
 #define BCH_T 8
-#define AES_KEY_FILE "aes_key.txt"
-#define AES_KEY_SIZE 32
-#define AES_IV_SIZE 16
-#define AES_BLOCK_SIZE 16
 
 int m, n, length, k, t, d;
 int p[21];
 int alpha_to[1048576], index_of[1048576], g[1048576];
 int data[1048576], bb[1048576];
-
-/* Load AES-256 key from hex file */
-int load_aes_key(unsigned char *key) {
-    FILE *fp = fopen(AES_KEY_FILE, "r");
-    if (!fp) {
-        fprintf(stderr, "Error: Cannot open key file '%s'\n", AES_KEY_FILE);
-        return -1;
-    }
-    char hex[65];
-    if (fscanf(fp, "%64s", hex) != 1 || strlen(hex) != 64) {
-        fprintf(stderr, "Error: Key file must contain 64 hex characters\n");
-        fclose(fp);
-        return -1;
-    }
-    fclose(fp);
-    
-    for (int i = 0; i < 32; i++) {
-        unsigned int byte;
-        sscanf(hex + 2*i, "%2x", &byte);
-        key[i] = (unsigned char)byte;
-    }
-    return 0;
-}
-
-/* AES-256-CBC encrypt (with PKCS7 padding) */
-int aes_cbc_encrypt(const unsigned char *plaintext, int plaintext_len,
-                    const unsigned char *key, const unsigned char *iv,
-                    unsigned char *ciphertext) {
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) return -1;
-    
-    int len, ciphertext_len;
-    
-    /* Initialize AES-256-CBC encryption - padding is enabled by default */
-    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        return -1;
-    }
-    
-    /* Encrypt the plaintext */
-    if (EVP_EncryptUpdate(ctx, ciphertext, &len, plaintext, plaintext_len) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        return -1;
-    }
-    ciphertext_len = len;
-    
-    /* Finalize encryption - this adds PKCS7 padding */
-    if (EVP_EncryptFinal_ex(ctx, ciphertext + len, &len) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        return -1;
-    }
-    ciphertext_len += len;
-    
-    EVP_CIPHER_CTX_free(ctx);
-    return ciphertext_len;
-}
 
 void generate_gf() {
     register int i, mask;
@@ -235,6 +173,87 @@ int bch_init() {
     return k;
 }
 
+#ifdef USE_AES
+/* AES-256-CTR encryption context */
+static EVP_CIPHER_CTX *aes_ctx = NULL;
+static unsigned char aes_key[32];
+static unsigned char aes_iv[16];
+
+/* Derive key from password using PBKDF2 */
+int aes_init_encrypt(const char *password) {
+    /* Fixed salt - in production, use random salt and transmit it */
+    unsigned char salt[16] = "BCH_AES_SALT_01";
+    
+    /* Derive 32-byte key from password */
+    if (PKCS5_PBKDF2_HMAC(password, strlen(password), salt, 16, 100000,
+                          EVP_sha256(), 32, aes_key) != 1) {
+        fprintf(stderr, "Error: Key derivation failed\n");
+        return -1;
+    }
+    
+    /* Use fixed IV derived from password (for reproducibility) */
+    if (PKCS5_PBKDF2_HMAC(password, strlen(password), salt, 16, 100000,
+                          EVP_sha256(), 16, aes_iv) != 1) {
+        fprintf(stderr, "Error: IV derivation failed\n");
+        return -1;
+    }
+    
+    aes_ctx = EVP_CIPHER_CTX_new();
+    if (!aes_ctx) return -1;
+    
+    if (EVP_EncryptInit_ex(aes_ctx, EVP_aes_256_ctr(), NULL, aes_key, aes_iv) != 1) {
+        EVP_CIPHER_CTX_free(aes_ctx);
+        return -1;
+    }
+    
+    fprintf(stderr, "AES-256-CTR encryption initialized\n");
+    return 0;
+}
+
+/* Encrypt data in-place using AES-CTR (XOR with keystream) */
+int aes_encrypt_block(unsigned char *data, int len) {
+    if (!aes_ctx) return len;  /* No encryption */
+    
+    unsigned char outbuf[64];
+    int outlen;
+    
+    if (EVP_EncryptUpdate(aes_ctx, outbuf, &outlen, data, len) != 1) {
+        return -1;
+    }
+    memcpy(data, outbuf, outlen);
+    return outlen;
+}
+
+void aes_cleanup() {
+    if (aes_ctx) {
+        EVP_CIPHER_CTX_free(aes_ctx);
+        aes_ctx = NULL;
+    }
+}
+
+/* Read password from pass.txt file */
+char* read_password_file() {
+    static char password[256];
+    FILE *fp = fopen("pass.txt", "r");
+    if (!fp) {
+        fprintf(stderr, "Warning: pass.txt not found, encryption disabled\n");
+        return NULL;
+    }
+    if (fgets(password, sizeof(password), fp) == NULL) {
+        fclose(fp);
+        return NULL;
+    }
+    fclose(fp);
+    /* Remove trailing newline */
+    size_t len = strlen(password);
+    while (len > 0 && (password[len-1] == '\n' || password[len-1] == '\r')) {
+        password[--len] = '\0';
+    }
+    if (len == 0) return NULL;
+    return password;
+}
+#endif
+
 void output_block_bits(double low_delay, double high_delay, int *first_output) {
     int i;
     int codeword[255];
@@ -268,35 +287,39 @@ void output_block_bits(double low_delay, double high_delay, int *first_output) {
 int main(int argc, char* argv[]) {
     if (argc != 4) {
         fprintf(stderr, "Usage: %s <input_file> <low_delay_ms> <high_delay_ms>\n", argv[0]);
-        fprintf(stderr, "BCH(%d,k,%d) encoder with AES-256-CBC for covert timing channels\n", BCH_N, 2*BCH_T+1);
-        fprintf(stderr, "Reads AES key from %s\n", AES_KEY_FILE);
+        fprintf(stderr, "BCH(%d,k,%d) encoder for covert timing channels\n", BCH_N, 2*BCH_T+1);
+        fprintf(stderr, "  AES-256-CTR encryption: place password in pass.txt\n");
         return 1;
     }
     
     char* input_file = argv[1];
     double low_delay = atof(argv[2]);
     double high_delay = atof(argv[3]);
+    char* password = NULL;
     
     if (low_delay <= 0 || high_delay <= 0 || low_delay >= high_delay) {
         fprintf(stderr, "Error: Invalid delay values\n");
         return 1;
     }
     
-    /* Load AES key */
-    unsigned char aes_key[AES_KEY_SIZE];
-    if (load_aes_key(aes_key) != 0) {
-        return 1;
+#ifdef USE_AES
+    /* Auto-read password from pass.txt */
+    password = read_password_file();
+    if (password) {
+        if (aes_init_encrypt(password) != 0) {
+            fprintf(stderr, "Error: Failed to initialize AES encryption\n");
+            return 1;
+        }
     }
-    fprintf(stderr, "[1] AES key loaded from %s\n", AES_KEY_FILE);
+#endif
     
     int actual_k = bch_init();
     if (actual_k <= 0) {
         fprintf(stderr, "Error: Failed to initialize BCH code\n");
         return 1;
     }
-    fprintf(stderr, "[2] BCH(%d,%d) initialized, t=%d\n", BCH_N, actual_k, BCH_T);
     
-    /* Read input file */
+    
     FILE* fp = fopen(input_file, "rb");
     if (!fp) {
         fprintf(stderr, "Error: Cannot open input file '%s'\n", input_file);
@@ -313,78 +336,37 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    unsigned char *plaintext = malloc(file_size);
-    if (!plaintext) {
-        fprintf(stderr, "Error: Memory allocation failed\n");
-        fclose(fp);
-        return 1;
-    }
-    fread(plaintext, 1, file_size, fp);
-    fclose(fp);
-    fprintf(stderr, "[3] Read %ld bytes from %s\n", file_size, input_file);
-    
-    /* AES-256-CBC encrypt */
-    unsigned char iv[AES_IV_SIZE];
-    if (RAND_bytes(iv, AES_IV_SIZE) != 1) {
-        fprintf(stderr, "Error: Failed to generate random IV\n");
-        free(plaintext);
-        return 1;
-    }
-    
-    /* CBC ciphertext = IV (16 bytes) + encrypted data (padded to block size) */
-    /* Max ciphertext size: IV + plaintext + up to 16 bytes padding */
-    long max_ciphertext_len = AES_IV_SIZE + file_size + AES_BLOCK_SIZE;
-    unsigned char *ciphertext = malloc(max_ciphertext_len);
-    if (!ciphertext) {
-        fprintf(stderr, "Error: Memory allocation failed\n");
-        free(plaintext);
-        return 1;
-    }
-    
-    /* Prepend IV */
-    memcpy(ciphertext, iv, AES_IV_SIZE);
-    
-    /* Encrypt with CBC (includes PKCS7 padding) */
-    int encrypted_len = aes_cbc_encrypt(plaintext, file_size, aes_key, iv, 
-                                        ciphertext + AES_IV_SIZE);
-    if (encrypted_len < 0) {
-        fprintf(stderr, "Error: AES-CBC encryption failed\n");
-        free(plaintext);
-        free(ciphertext);
-        return 1;
-    }
-    long ciphertext_len = AES_IV_SIZE + encrypted_len;
-    fprintf(stderr, "[4] AES-CBC encrypted: %ld bytes (IV + padded ciphertext)\n", ciphertext_len);
-    
-    free(plaintext);
-    
-    /* BCH encode the ciphertext */
     int data_bytes_per_block = (actual_k + 7) / 8;
-    int total_blocks = (ciphertext_len + data_bytes_per_block - 1) / data_bytes_per_block;
+    int total_blocks = (file_size + data_bytes_per_block - 1) / data_bytes_per_block;
     int total_bits_encoded = 0;
     int first_output = 1;
     
-    fprintf(stderr, "[5] BCH encoding %ld bytes in %d blocks\n", ciphertext_len, total_blocks);
+    fprintf(stderr, "Processing %ld bytes in %d blocks\n", file_size, total_blocks);
+    fprintf(stderr, "IMPORTANT: Original file size = %ld bytes (pass to decoder with -s flag)\n", file_size);
     
     for (int block_num = 0; block_num < total_blocks; block_num++) {
         unsigned char block_data[32];
         memset(block_data, 0, sizeof(block_data));
         
-        long offset = (long)block_num * data_bytes_per_block;
-        int bytes_to_read = data_bytes_per_block;
-        if (offset + bytes_to_read > ciphertext_len) {
-            bytes_to_read = ciphertext_len - offset;
+        int bytes_read = fread(block_data, 1, data_bytes_per_block, fp);
+        if (bytes_read <= 0) break;
+        
+#ifdef USE_AES
+        /* Encrypt block before BCH encoding */
+        if (password) {
+            aes_encrypt_block(block_data, bytes_read);
         }
-        memcpy(block_data, ciphertext + offset, bytes_to_read);
+#endif
         
         // Convert bytes to bits and store in data array
         memset(data, 0, sizeof(data));
-        for (int i = 0; i < bytes_to_read * 8 && i < actual_k; i++) {
+        for (int i = 0; i < bytes_read * 8 && i < actual_k; i++) {
             int byte_idx = i / 8;
             int bit_idx = i % 8;  // LSB first
             data[i] = (block_data[byte_idx] >> bit_idx) & 1;
         }       
 
+        
         encode_bch();
         
         // Output encoded block as IAT values
@@ -397,15 +379,18 @@ int main(int argc, char* argv[]) {
         }
     }
     
-    free(ciphertext);
+    fclose(fp);
 
-    fprintf(stderr, "\n[6] Encoding complete:\n");
+    fprintf(stderr, "\nEncoding complete:\n");
     fprintf(stderr, "- Input: %ld bytes\n", file_size);
-    fprintf(stderr, "- Ciphertext: %ld bytes (with nonce)\n", ciphertext_len);
     fprintf(stderr, "- Blocks: %d\n", total_blocks);
     fprintf(stderr, "- Encoded bits: %d\n", total_bits_encoded);
     fprintf(stderr, "- Total IAT values: %d\n", total_bits_encoded);
     fprintf(stderr, "- Overall rate: %.4f\n", (float)(file_size * 8) / total_bits_encoded);
+    if (password) fprintf(stderr, "- Encryption: AES-256-CTR\n");
     
+#ifdef USE_AES
+    aes_cleanup();
+#endif
     return 0;
 }

@@ -1,85 +1,25 @@
 /* bch_decode.c
- * BCH Decoder with AES-256-CBC for IAT covert channel (LSB-first)
- * Usage: ./bch_decode <m> <length> <t> <timing_file> <threshold>
+ * BCH Decoder adapted for IAT covert channel (LSB-first)
+ * Usage: ./bch_decode <m> <length> <t> <timing_file> <threshold> [original_size] [-k password]
  *
  * timing_file may be CSV or newline-separated timings (ms). Threshold is in same units.
- * Pipeline: IAT input -> BCH decode -> AES-256-CBC decrypt (with PKCS7 unpadding) -> file
- * Reads AES key from aes_key.txt
- * 
- * Compile: gcc -o bch_decode bch_decode.c -lssl -lcrypto
  */
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef USE_AES
 #include <openssl/evp.h>
+#endif
 
 #define MAX_TIMINGS 10000000  /* grow if you need more */
-#define AES_KEY_FILE "aes_key.txt"
-#define AES_KEY_SIZE 32
-#define AES_IV_SIZE 16
 
 int m, n, length, k, t, d;
 int p[21];
 int alpha_to[1048576], index_of[1048576], g[548576];
 int recd[1048576];
-
-/* Load AES-256 key from hex file */
-int load_aes_key(unsigned char *key) {
-    FILE *fp = fopen(AES_KEY_FILE, "r");
-    if (!fp) {
-        fprintf(stderr, "Error: Cannot open key file '%s'\n", AES_KEY_FILE);
-        return -1;
-    }
-    char hex[65];
-    if (fscanf(fp, "%64s", hex) != 1 || strlen(hex) != 64) {
-        fprintf(stderr, "Error: Key file must contain 64 hex characters\n");
-        fclose(fp);
-        return -1;
-    }
-    fclose(fp);
-    
-    for (int i = 0; i < 32; i++) {
-        unsigned int byte;
-        sscanf(hex + 2*i, "%2x", &byte);
-        key[i] = (unsigned char)byte;
-    }
-    return 0;
-}
-
-/* AES-256-CBC decrypt (with PKCS7 unpadding) */
-int aes_cbc_decrypt(const unsigned char *ciphertext, int ciphertext_len,
-                    const unsigned char *key, const unsigned char *iv,
-                    unsigned char *plaintext) {
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) return -1;
-    
-    int len, plaintext_len;
-    
-    /* Initialize AES-256-CBC decryption - padding removal is enabled by default */
-    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        return -1;
-    }
-    
-    /* Decrypt the ciphertext */
-    if (EVP_DecryptUpdate(ctx, plaintext, &len, ciphertext, ciphertext_len) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        return -1;
-    }
-    plaintext_len = len;
-    
-    /* Finalize decryption - this removes PKCS7 padding */
-    if (EVP_DecryptFinal_ex(ctx, plaintext + len, &len) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        return -1;
-    }
-    plaintext_len += len;
-    
-    EVP_CIPHER_CTX_free(ctx);
-    return plaintext_len;
-}
 
 void generate_gf() {
     register int i, mask;
@@ -408,11 +348,9 @@ int timings_to_recd(double *timings, int length, double threshold) {
 }
 
 /* Extract data bits from recd[] (last k bits) into output_data (LSB-first) */
-/* Only extract k/8*8 bits (184 bits = 23 bytes) to match encoder */
-void extract_data_bits_from_recd(unsigned char *output_data, int bytes_to_extract) {
-    memset(output_data, 0, bytes_to_extract);
-    int bits_to_extract = bytes_to_extract * 8;
-    for (int i = 0; i < bits_to_extract && i < k; i++) {
+void extract_data_bits_from_recd(unsigned char *output_data) {
+    memset(output_data, 0, (k + 7) / 8);
+    for (int i = 0; i < k; i++) {
         int codeword_pos = i + (length - k);
         if (recd[codeword_pos]) {
             int byte_idx = i / 8;
@@ -422,12 +360,94 @@ void extract_data_bits_from_recd(unsigned char *output_data, int bytes_to_extrac
     }
 }
 
+#ifdef USE_AES
+/* AES-256-CTR decryption context */
+static EVP_CIPHER_CTX *aes_ctx = NULL;
+static unsigned char aes_key[32];
+static unsigned char aes_iv[16];
+
+/* Derive key from password using PBKDF2 (must match encoder) */
+int aes_init_decrypt(const char *password) {
+    /* Fixed salt - must match encoder */
+    unsigned char salt[16] = "BCH_AES_SALT_01";
+    
+    /* Derive 32-byte key from password */
+    if (PKCS5_PBKDF2_HMAC(password, strlen(password), salt, 16, 100000,
+                          EVP_sha256(), 32, aes_key) != 1) {
+        fprintf(stderr, "Error: Key derivation failed\n");
+        return -1;
+    }
+    
+    /* Use fixed IV derived from password (must match encoder) */
+    if (PKCS5_PBKDF2_HMAC(password, strlen(password), salt, 16, 100000,
+                          EVP_sha256(), 16, aes_iv) != 1) {
+        fprintf(stderr, "Error: IV derivation failed\n");
+        return -1;
+    }
+    
+    aes_ctx = EVP_CIPHER_CTX_new();
+    if (!aes_ctx) return -1;
+    
+    /* CTR mode: encryption and decryption are the same operation */
+    if (EVP_DecryptInit_ex(aes_ctx, EVP_aes_256_ctr(), NULL, aes_key, aes_iv) != 1) {
+        EVP_CIPHER_CTX_free(aes_ctx);
+        return -1;
+    }
+    
+    fprintf(stderr, "AES-256-CTR decryption initialized\n");
+    return 0;
+}
+
+/* Decrypt data in-place using AES-CTR */
+int aes_decrypt_block(unsigned char *data, int len) {
+    if (!aes_ctx) return len;  /* No decryption */
+    
+    unsigned char outbuf[64];
+    int outlen;
+    
+    if (EVP_DecryptUpdate(aes_ctx, outbuf, &outlen, data, len) != 1) {
+        return -1;
+    }
+    memcpy(data, outbuf, outlen);
+    return outlen;
+}
+
+void aes_cleanup() {
+    if (aes_ctx) {
+        EVP_CIPHER_CTX_free(aes_ctx);
+        aes_ctx = NULL;
+    }
+}
+
+/* Read password from pass.txt file */
+char* read_password_file() {
+    static char password[256];
+    FILE *fp = fopen("pass.txt", "r");
+    if (!fp) {
+        fprintf(stderr, "Warning: pass.txt not found, decryption disabled\n");
+        return NULL;
+    }
+    if (fgets(password, sizeof(password), fp) == NULL) {
+        fclose(fp);
+        return NULL;
+    }
+    fclose(fp);
+    /* Remove trailing newline */
+    size_t len = strlen(password);
+    while (len > 0 && (password[len-1] == '\n' || password[len-1] == '\r')) {
+        password[--len] = '\0';
+    }
+    if (len == 0) return NULL;
+    return password;
+}
+#endif
+
 int main(int argc, char* argv[]) {
-    if (argc != 6) {
-        printf("Usage: %s <m> <length> <t> <timing_file> <threshold>\n", argv[0]);
-        printf("Example: %s 8 255 8 timing_values.txt 15.0\n", argv[0]);
-        printf("BCH decoder with AES-256-CBC for covert timing channels\n");
-        printf("Reads AES key from %s\n", AES_KEY_FILE);
+    if (argc < 6 || argc > 7) {
+        printf("Usage: %s <m> <length> <t> <timing_file> <threshold> [original_size]\n", argv[0]);
+        printf("Example: %s 8 255 8 timing_values.txt 15.0 1024\n", argv[0]);
+        printf("  original_size: optional, truncate output to exact byte count\n");
+        printf("  AES-256-CTR decryption: place password in pass.txt\n");
         return 1;
     }
 
@@ -436,23 +456,34 @@ int main(int argc, char* argv[]) {
     int code_t = atoi(argv[3]);
     char *timing_file = argv[4];
     double threshold = atof(argv[5]);
-
-    fprintf(stderr, "=== BCH Decoder with AES-256-CBC (LSB-first) ===\n");
-    fprintf(stderr, "[1] Params: m=%d length=%d t=%d threshold=%.3f\n", code_m, code_length, code_t, threshold);
-
-    /* Load AES key */
-    unsigned char aes_key[AES_KEY_SIZE];
-    if (load_aes_key(aes_key) != 0) {
-        return 1;
+    long original_size = -1;  /* -1 means output all bytes */
+    char *password = NULL;
+    
+    if (argc == 7) {
+        original_size = atol(argv[6]);
+        fprintf(stderr, "Will truncate output to %ld bytes\n", original_size);
     }
-    fprintf(stderr, "[2] AES key loaded from %s\n", AES_KEY_FILE);
+    
+#ifdef USE_AES
+    /* Auto-read password from pass.txt */
+    password = read_password_file();
+    if (password) {
+        if (aes_init_decrypt(password) != 0) {
+            fprintf(stderr, "Error: Failed to initialize AES decryption\n");
+            return 1;
+        }
+    }
+#endif
+
+    fprintf(stderr, "=== BCH Decoder with IAT (LSB-first) ===\n");
+    fprintf(stderr, "Params: m=%d length=%d t=%d threshold=%.3f\n", code_m, code_length, code_t, threshold);
 
     int actual_k = bch_init(code_m, code_length, code_t);
     if (actual_k < 0) {
         fprintf(stderr, "Failed to initialize BCH\n");
         return 1;
     }
-    fprintf(stderr, "[3] BCH initialized: length=%d data_bits=%d (k)\n", length, actual_k);
+    fprintf(stderr, "BCH initialized: length=%d data_bits=%d (k)\n", length, actual_k);
 
     long timing_count = 0;
     double *timings = read_timings(timing_file, &timing_count);
@@ -460,7 +491,7 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Error reading timing file '%s'\n", timing_file);
         return 1;
     }
-    fprintf(stderr, "[4] Read %ld timing values from %s\n", timing_count, timing_file);
+    fprintf(stderr, "Read %ld timing values from %s\n", timing_count, timing_file);
 
     /* Process each full codeword (length timings) */
     int blocks = timing_count / length;
@@ -468,18 +499,8 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Warning: no full codeword blocks present (need %d timings per block)\n", length);
     }
     
-    /* Collect all decoded bytes (will be nonce + ciphertext) */
-    int bytes_per_block = k / 8;  /* Use floor: 191/8=23 bytes to match encoder */
-    long max_decoded_bytes = (long)blocks * bytes_per_block;
-    unsigned char *all_decoded = malloc(max_decoded_bytes);
-    if (!all_decoded) {
-        fprintf(stderr, "Error: Memory allocation failed\n");
-        free(timings);
-        return 1;
-    }
-    long total_decoded_bytes = 0;
-    int total_errors = 0;
-    int failed_blocks = 0;
+    int data_bytes_per_block = (k + 7) / 8;
+    long bytes_written = 0;
     
     for (int b = 0; b < blocks; b++) {
         double *block_timings = timings + (long)b * length;
@@ -488,85 +509,55 @@ int main(int argc, char* argv[]) {
         if (timings_to_recd(block_timings, length, threshold) != 0) {
             fprintf(stderr, "Error reconstructing bits for block %d\n", b);
             free(timings);
-            free(all_decoded);
             return 1;
         }
 
         /* Debug: show first 32 bits of recd[] */
-        if (b == 0) {
-            fprintf(stderr, "Block %d: first 32 received bits: ", b);
-            for (int i = 0; i < 32 && i < length; i++) fprintf(stderr, "%d", recd[i]);
-            fprintf(stderr, "\n");
-        }
+        fprintf(stderr, "Block %d: first 32 received bits: ", b);
+        for (int i = 0; i < 32 && i < length; i++) fprintf(stderr, "%d", recd[i]);
+        fprintf(stderr, "\n");
 
         /* Try BCH decode */
         int errors = decode_bch();
         if (errors < 0) {
             fprintf(stderr, "Block %d: BCH decode failed (uncorrectable)\n", b);
-            failed_blocks++;
-            /* Fill with zeros and continue */
-            memset(all_decoded + total_decoded_bytes, 0, bytes_per_block);
-            total_decoded_bytes += bytes_per_block;
             continue;
         }
-        total_errors += errors;
+        fprintf(stderr, "Block %d: BCH decode OK, errors corrected=%d\n", b, errors);
 
-        /* Extract k/8 data bytes and append to all_decoded */
-        unsigned char out_bytes[bytes_per_block];
-        extract_data_bits_from_recd(out_bytes, bytes_per_block);
-        memcpy(all_decoded + total_decoded_bytes, out_bytes, bytes_per_block);
-        total_decoded_bytes += bytes_per_block;
+        /* Extract k data bits */
+        unsigned char out_bytes[data_bytes_per_block];
+        extract_data_bits_from_recd(out_bytes);
+        
+#ifdef USE_AES
+        /* Decrypt block after BCH decoding */
+        if (password) {
+            aes_decrypt_block(out_bytes, data_bytes_per_block);
+        }
+#endif
+        
+        /* Write bytes, respecting original_size if specified */
+        int to_write = data_bytes_per_block;
+        if (original_size >= 0) {
+            long remaining = original_size - bytes_written;
+            if (remaining <= 0) break;
+            if (to_write > remaining) to_write = (int)remaining;
+        }
+        fwrite(out_bytes, 1, to_write, stdout);
+        bytes_written += to_write;
+        fflush(stdout);
     }
     
-    fprintf(stderr, "[5] BCH decoded: %ld bytes, %d errors corrected", total_decoded_bytes, total_errors);
-    if (failed_blocks > 0) {
-        fprintf(stderr, ", %d blocks failed", failed_blocks);
+    fprintf(stderr, "Total bytes written: %ld\n", bytes_written);
+    if (original_size >= 0 && bytes_written != original_size) {
+        fprintf(stderr, "WARNING: Expected %ld bytes but wrote %ld\n", original_size, bytes_written);
     }
-    fprintf(stderr, "\n");
+    if (password) fprintf(stderr, "Decryption: AES-256-CTR\n");
 
+#ifdef USE_AES
+    aes_cleanup();
+#endif
     free(timings);
-    
-    /* Check if we have at least IV + some data */
-    if (total_decoded_bytes < AES_IV_SIZE) {
-        fprintf(stderr, "Error: Decoded data too short (need at least %d bytes for IV)\n", AES_IV_SIZE);
-        free(all_decoded);
-        return 1;
-    }
-    
-    /* Extract IV and ciphertext */
-    unsigned char *iv = all_decoded;
-    unsigned char *ciphertext = all_decoded + AES_IV_SIZE;
-    long ciphertext_len = total_decoded_bytes - AES_IV_SIZE;
-    
-    /* AES-256-CBC decrypt */
-    unsigned char *plaintext = malloc(ciphertext_len);
-    if (!plaintext) {
-        fprintf(stderr, "Error: Memory allocation failed\n");
-        free(all_decoded);
-        return 1;
-    }
-    
-    int plaintext_len = aes_cbc_decrypt(ciphertext, ciphertext_len, aes_key, iv, plaintext);
-    if (plaintext_len < 0) {
-        fprintf(stderr, "Error: AES-CBC decryption failed (padding error or wrong key)\n");
-        free(all_decoded);
-        free(plaintext);
-        return 1;
-    }
-    fprintf(stderr, "[6] AES-CBC decrypted: %d bytes\n", plaintext_len);
-    
-    /* Write plaintext to stdout */
-    fwrite(plaintext, 1, plaintext_len, stdout);
-    fflush(stdout);
-    
-    fprintf(stderr, "\n=== Decoding complete ===\n");
-    fprintf(stderr, "- Timing values: %ld\n", timing_count);
-    fprintf(stderr, "- BCH blocks: %d\n", blocks);
-    fprintf(stderr, "- Errors corrected: %d\n", total_errors);
-    fprintf(stderr, "- Output: %d bytes\n", plaintext_len);
-
-    free(all_decoded);
-    free(plaintext);
     return 0;
 }
 
