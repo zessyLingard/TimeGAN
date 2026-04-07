@@ -1,20 +1,19 @@
 """
 CTC-GAN Encoder (Covert Timing Channel)
-Pipeline: file → AES-256 → BCH → GAN (Shared Seed) → IPD (CSV)
+Pipeline: file → BCH encode (C binary, AES optional via pass.txt) → GAN (Shared Seed) → IPD (CSV)
 
-Reads AES key from aes_key.txt
+AES encryption is handled by bch_encode (compile with -DUSE_AES if needed).
+Place password in pass.txt to enable AES.
 """
 import os
 import sys
 import argparse
+import subprocess
+import tempfile
 import torch
 import torch.nn as nn
 import numpy as np
 import pandas as pd
-import bch_wrapper
-
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.backends import default_backend
 
 # ============================================================
 # KIẾN TRÚC MODEL TỪ ĐỒ ÁN
@@ -51,8 +50,8 @@ class NoiseGenerator(nn.Module):
 # ============================================================
 # PRE-SHARED PARAMETERS (PHẢI GIỐNG FILE HUẤN LUYỆN)
 # ============================================================
-MODEL_PATH = "models/covert_channel_generator.pth" 
-KEY_FILE = "aes_key.txt"
+MODEL_PATH = "models/covert_channel_generator.pth"
+BCH_ENCODE_BIN = "./bch_encode"
 
 # Hằng số vật lý (từ đồ án)
 PHYS_MIN = 0.0
@@ -68,32 +67,49 @@ SEQ_LEN = 24
 HIDDEN_DIM = 24
 NUM_LAYERS = 3
 MODULE_NAME = "gru"
-NOISE_SCALE = 0.4 # Phải khớp với lúc training
-SEED = 2025 # Shared seed cực kỳ quan trọng
+NOISE_SCALE = 0.4  # Phải khớp với lúc training
+SEED = 2025         # Shared seed cực kỳ quan trọng
 
-# BCH Params
-BCH_N = 255
-BCH_K = 191
-BCH_T = 8
+# BCH Params (dùng cho bch_encode binary)
+BCH_LOW_DELAY = 5.0    # ms - đại diện bit=1
+BCH_HIGH_DELAY = 15.0  # ms - đại diện bit=0
+BCH_THRESHOLD = 10.0   # ms - ngưỡng phân biệt 0/1
 
 def inverse_scale(data_scaled):
     return data_scaled * (PHYS_MAX - PHYS_MIN) + PHYS_MIN
 
-def load_key():
-    with open(KEY_FILE, 'r') as f:
-        key_hex = f.read().strip()
-    return bytes.fromhex(key_hex)
-
-def bytes_to_bits(data):
-    bits = []
-    for byte in data:
-        for i in range(8):
-            bits.append((byte >> i) & 1)
-    return bits
-
 def set_seed(seed):
     torch.manual_seed(seed)
     np.random.seed(seed)
+
+def bch_encode_file(input_file):
+    """Gọi ./bch_encode binary và parse output IAT thành bits."""
+    result = subprocess.run(
+        [BCH_ENCODE_BIN, input_file, str(BCH_LOW_DELAY), str(BCH_HIGH_DELAY)],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print(f"bch_encode stderr:\n{result.stderr}", file=sys.stderr)
+        raise RuntimeError(f"bch_encode failed with code {result.returncode}")
+    
+    # Parse stderr for info
+    if result.stderr:
+        for line in result.stderr.strip().split('\n'):
+            print(f"  [bch] {line}")
+    
+    # Parse stdout: CSV of IAT values → convert to bits
+    iat_str = result.stdout.strip()
+    if not iat_str:
+        raise RuntimeError("bch_encode produced no output")
+    
+    iat_values = [float(x) for x in iat_str.split(',')]
+    
+    # IAT → bits: <= threshold → 1, > threshold → 0
+    encoded_bits = []
+    for iat in iat_values:
+        encoded_bits.append(1 if iat <= BCH_THRESHOLD else 0)
+    
+    return encoded_bits
 
 def main():
     parser = argparse.ArgumentParser()
@@ -107,54 +123,31 @@ def main():
     
     device = torch.device("cpu")
     
-    # 1. Load AES key
-    key = load_key()
-    print(f"[1] AES key loaded from {KEY_FILE}")
-    
-    # 2. Khởi tạo và load Model
+    # 1. Khởi tạo và load Model
     model = NoiseGenerator(MODULE_NAME, input_dim=2, hidden_dim=HIDDEN_DIM, 
                            num_layers=NUM_LAYERS, noise_scale=NOISE_SCALE).to(device)
     try:
         model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-        print(f"[2] GAN model (generator) loaded successfully from {MODEL_PATH}")
+        print(f"[1] GAN model loaded from {MODEL_PATH}")
     except Exception as e:
         print(f"Lỗi load model: Có thể bạn lưu full dict. Đang thử cách 2...")
         full_dict = torch.load('covert_channel_full_model.pth', map_location=device)
         model.load_state_dict(full_dict['generator'])
-        print(f"[2] GAN model loaded from covert_channel_full_model.pth")
+        print(f"[1] GAN model loaded from covert_channel_full_model.pth")
         
     model.eval()
 
-    # 3. Khởi tạo BCH
-    k = bch_wrapper._BCH_K
-    print(f"[3] BCH({BCH_N},{k}) ready, t={BCH_T}")
+    # 2. Đọc file size (để decoder biết cắt đúng)
+    file_size = os.path.getsize(args.file)
+    print(f"[2] Input file: {args.file} ({file_size} bytes)")
     
-    # 4. Đọc file
-    with open(args.file, 'rb') as f:
-        plaintext = f.read()
-    print(f"[4] Read {len(plaintext)} bytes: {args.file}")
+    # 3. BCH encode (gọi C binary, AES tùy thuộc pass.txt)
+    print(f"[3] BCH encoding via {BCH_ENCODE_BIN}...")
+    encoded_bits = bch_encode_file(args.file)
+    print(f"    → {len(encoded_bits)} encoded bits")
     
-    # 5. AES encrypt
-    nonce = os.urandom(16)
-    cipher = Cipher(algorithms.AES(key), modes.CTR(nonce), backend=default_backend())
-    encryptor = cipher.encryptor()
-    ciphertext = nonce + encryptor.update(plaintext) + encryptor.finalize()
-    print(f"[5] AES encrypted: {len(ciphertext)} bytes")
-    
-    data_bits = bytes_to_bits(ciphertext)
-    
-    # 6. BCH encode
-    num_blocks = (len(data_bits) + k - 1) // k
-    padded_bits = data_bits + [0] * (num_blocks * k - len(data_bits))
-    encoded_bits = []
-    for b in range(num_blocks):
-        block = padded_bits[b*k:(b+1)*k]
-        codeword = bch_wrapper.encode(block)
-        encoded_bits.extend(codeword)
-    print(f"[6] BCH encoded: {len(encoded_bits)} bits ({num_blocks} blocks)")
-    
-    # 7. GAN encode (Nhúng thông điệp vào Covert Channel)
-    print("[7] Nhúng gói tin qua GAN...")
+    # 4. GAN encode (Nhúng thông điệp vào Covert Channel)
+    print("[4] Nhúng gói tin qua GAN...")
     
     # Reset seed để đảm bảo vector Z đồng bộ giữa người gửi và nhận
     set_seed(SEED)
@@ -193,14 +186,15 @@ def main():
         actual_len = SEQ_LEN - pad_len
         ipds.extend(final_ipd_phys[:actual_len].tolist())
         
-    print(f"[7] GAN encoded: {len(ipds)} IPDs")
+    print(f"[4] GAN encoded: {len(ipds)} IPDs")
     
-    # 8. Save
+    # 5. Save
     pd.DataFrame({'IPDs': ipds}).to_csv(args.output, index=False)
-    print(f"[8] Saved: {args.output}")
+    print(f"[5] Saved: {args.output}")
     
     print(f"\n{'='*50}")
-    print(f"Hoàn thành! {len(plaintext)} bytes → {len(ipds)} IPDs")
+    print(f"Hoàn thành! {file_size} bytes → {len(ipds)} IPDs")
+    print(f"Original file size: {file_size} (pass to decoder)")
     print(f"Tổng thời gian gửi dự kiến: {sum(ipds):.1f} giây")
     print(f"{'='*50}")
 
