@@ -14,6 +14,7 @@ secret.txt
 secret_*.txt
 *.secret
 aes_key.txt
+*.o
 
 # Ignored folders
 venv/
@@ -21,3 +22,5 @@ results/
 decoded/
 encoded/
 test/
+data/
+timing/
