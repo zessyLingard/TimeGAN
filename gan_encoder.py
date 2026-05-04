@@ -13,9 +13,9 @@ import os
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Protocol
-FRAME_SIZE    = 18
+FRAME_SIZE    = 10
 BITS_PER_FILE = 510
-TOTAL_PACKETS = 9180
+TOTAL_PACKETS = 5100
 
 # Neural Network (Matches kaggle_notebook.py exactly)
 CONTEXT_W = 32
@@ -28,10 +28,10 @@ COND_BIT0  = 1
 COND_BIT1  = 2
 
 # Thresholds
-GAP_THRESHOLD    = 0.20
-BIT0_LO, BIT0_HI = 0.40, 0.55
-BIT1_LO, BIT1_HI = 0.70, 1.22
-DECODE_THRESHOLD = 0.625
+GAP_THRESHOLD    = 0.08
+BIT0_LO, BIT0_HI = 0.1, 0.2
+BIT1_LO, BIT1_HI = 0.45, 0.7
+DECODE_THRESHOLD = 0.325
 
 # ==========================================
 # 2. DATA LOADING & SCALING
@@ -183,7 +183,7 @@ def main():
     parser = argparse.ArgumentParser(description="Full Covert Channel Encoder (AES + BCH + GAN)")
     parser.add_argument("input_file", help="The secret text file to encode")
     parser.add_argument("output_file", help="The comma-separated timing file for client.c")
-    parser.add_argument("--weights", default="stealth_ctc_generator.pth", help="Path to trained GAN weights")
+    parser.add_argument("--weights", default="stealth_ctc_generator_v2.pth", help="Path to trained GAN weights")
     args = parser.parse_args()
 
     if not os.path.exists("./bch_encode"):
